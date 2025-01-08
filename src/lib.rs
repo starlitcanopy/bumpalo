@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_debug_implementations)]
 #![deny(missing_docs)]
+#![allow(clippy::mut_from_ref)]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(feature = "allocator_api", feature(allocator_api))]
 
@@ -16,7 +17,7 @@ mod alloc;
 
 use core::cell::Cell;
 use core::fmt::Display;
-use core::iter;
+use core::iter::{self, Empty};
 use core::marker::PhantomData;
 use core::mem;
 use core::ptr::{self, NonNull};
@@ -287,12 +288,12 @@ impl<E: Display> Display for AllocOrInitError<E> {
 /// Because of backwards compatibility, allocations that fail
 /// due to allocation limits will not present differently than
 /// errors due to resource exhaustion.
-
 #[derive(Debug)]
 pub struct Bump {
     // The current chunk we are bump allocating within.
     current_chunk_footer: Cell<NonNull<ChunkFooter>>,
     allocation_limit: Cell<Option<usize>>,
+    empty_chunk: &'static EmptyChunkFooter,
 }
 
 #[repr(C)]
@@ -319,6 +320,9 @@ struct ChunkFooter {
     // the allocated_bytes of the current chunk plus the allocated bytes
     // of the `prev` chunk.
     allocated_bytes: usize,
+
+    // Reference to the canonical empty chunk in the dynamic lib this footer was initialized by
+    empty_chunk: &'static EmptyChunkFooter,
 }
 
 /// A wrapper type for the canonical, statically allocated empty chunk.
@@ -327,6 +331,7 @@ struct ChunkFooter {
 /// is the purpose of this wrapper type. This is safe because the empty chunk is
 /// immutable and never actually modified.
 #[repr(transparent)]
+#[derive(Debug)]
 struct EmptyChunkFooter(ChunkFooter);
 
 unsafe impl Sync for EmptyChunkFooter {}
@@ -351,6 +356,8 @@ static EMPTY_CHUNK: EmptyChunkFooter = EmptyChunkFooter(ChunkFooter {
 
     // Empty chunks count as 0 allocated bytes in an arena.
     allocated_bytes: 0,
+
+    empty_chunk: &EMPTY_CHUNK,
 });
 
 impl EmptyChunkFooter {
@@ -373,7 +380,7 @@ impl ChunkFooter {
 
     /// Is this chunk the last empty chunk?
     fn is_empty(&self) -> bool {
-        ptr::eq(self, EMPTY_CHUNK.get().as_ptr())
+        ptr::eq(self, self.empty_chunk.get().as_ptr())
     }
 }
 
@@ -540,6 +547,7 @@ impl Bump {
             return Ok(Bump {
                 current_chunk_footer: Cell::new(EMPTY_CHUNK.get()),
                 allocation_limit: Cell::new(None),
+                empty_chunk: &EMPTY_CHUNK,
             });
         }
 
@@ -557,6 +565,7 @@ impl Bump {
         Ok(Bump {
             current_chunk_footer: Cell::new(chunk_footer),
             allocation_limit: Cell::new(None),
+            empty_chunk: &EMPTY_CHUNK,
         })
     }
 
@@ -719,6 +728,7 @@ impl Bump {
                 prev: Cell::new(prev),
                 ptr,
                 allocated_bytes,
+                empty_chunk: &EMPTY_CHUNK,
             },
         );
 
@@ -767,7 +777,7 @@ impl Bump {
             let mut cur_chunk = self.current_chunk_footer.get();
 
             // Deallocate all chunks except the current one
-            let prev_chunk = cur_chunk.as_ref().prev.replace(EMPTY_CHUNK.get());
+            let prev_chunk = cur_chunk.as_ref().prev.replace(self.empty_chunk.get());
             dealloc_chunk_list(prev_chunk);
 
             // Reset the bump finger to the end of the chunk.
